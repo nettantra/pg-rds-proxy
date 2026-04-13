@@ -48,6 +48,7 @@ func main() {
 	flag.StringVar(&cfg.Upstream, "upstream", os.Getenv("PGRP_UPSTREAM"), "RDS upstream host:port")
 	flag.StringVar(&cfg.UpstreamTLS, "upstream-tls", env("PGRP_UPSTREAM_TLS", "require"), "upstream TLS mode: disable|require|verify-full")
 	flag.BoolVar(&cfg.LogRewrites, "log-rewrites", env("PGRP_LOG_REWRITES", "") != "", "log each statement the proxy rewrites")
+	flag.BoolVar(&cfg.AutoGrantRoles, "auto-grant-roles", env("PGRP_AUTO_GRANT_ROLES", "") != "", "after CREATE ROLE/USER, run GRANT <newrole> TO <connecting user> on the same connection (RDS workaround for must-be-able-to-SET-ROLE errors)")
 	flag.StringVar(&logLevel, "log-level", env("PGRP_LOG_LEVEL", "info"), "log level: debug|info|warn|error")
 	flag.BoolVar(&showVersion, "version", false, "print version and exit")
 	flag.Parse()

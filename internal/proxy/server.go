@@ -22,10 +22,51 @@ import (
 )
 
 type Config struct {
-	Listen      string
-	Upstream    string
-	UpstreamTLS string
-	LogRewrites bool
+	Listen         string
+	Upstream       string
+	UpstreamTLS    string
+	LogRewrites    bool
+	AutoGrantRoles bool
+}
+
+// fixupState carries per-connection state for the auto-grant feature: the
+// list of roles created since the last ReadyForQuery, plus a mutex that
+// serializes writes to the upstream Frontend (so the GRANT injection can't
+// interleave bytes with a normal client→upstream forward).
+type fixupState struct {
+	masterRole string
+	pendingMu  sync.Mutex
+	pending    []string
+	sendMu     sync.Mutex
+}
+
+func newFixupState(masterRole string) *fixupState {
+	return &fixupState{masterRole: masterRole}
+}
+
+func (s *fixupState) enabled() bool { return s.masterRole != "" }
+
+func (s *fixupState) record(role string) {
+	if !s.enabled() || role == "" {
+		return
+	}
+	s.pendingMu.Lock()
+	s.pending = append(s.pending, role)
+	s.pendingMu.Unlock()
+}
+
+func (s *fixupState) drain() []string {
+	if !s.enabled() {
+		return nil
+	}
+	s.pendingMu.Lock()
+	defer s.pendingMu.Unlock()
+	if len(s.pending) == 0 {
+		return nil
+	}
+	out := s.pending
+	s.pending = nil
+	return out
 }
 
 func Serve(ctx context.Context, cfg Config) error {
@@ -102,9 +143,15 @@ func handle(ctx context.Context, client net.Conn, cfg Config) error {
 		return fmt.Errorf("forward startup: %w", err)
 	}
 
+	var grantTarget string
+	if cfg.AutoGrantRoles {
+		grantTarget = startup.Parameters["user"]
+	}
+	fixup := newFixupState(grantTarget)
+
 	errCh := make(chan error, 2)
-	go func() { errCh <- pumpUpstreamToClient(frontend, backend) }()
-	go func() { errCh <- pumpClientToUpstream(backend, frontend, cfg) }()
+	go func() { errCh <- pumpUpstreamToClient(frontend, backend, fixup) }()
+	go func() { errCh <- pumpClientToUpstream(backend, frontend, cfg, fixup) }()
 
 	first := <-errCh
 	_ = upstream.Close()
@@ -116,7 +163,7 @@ func handle(ctx context.Context, client net.Conn, cfg Config) error {
 	return first
 }
 
-func pumpUpstreamToClient(fe *pgproto3.Frontend, be *pgproto3.Backend) error {
+func pumpUpstreamToClient(fe *pgproto3.Frontend, be *pgproto3.Backend, fixup *fixupState) error {
 	for {
 		msg, err := fe.Receive()
 		if err != nil {
@@ -148,6 +195,14 @@ func pumpUpstreamToClient(fe *pgproto3.Frontend, be *pgproto3.Backend) error {
 			_ = be.SetAuthType(pgproto3.AuthTypeCleartextPassword)
 		case *pgproto3.AuthenticationOk:
 			_ = be.SetAuthType(pgproto3.AuthTypeOk)
+		case *pgproto3.ReadyForQuery:
+			// At every server-idle point, run any queued GRANTs out-of-band on
+			// the same backend connection before letting the client see RfQ.
+			if pending := fixup.drain(); len(pending) > 0 {
+				if err := runGrantFixup(fe, pending, fixup); err != nil {
+					slog.Warn("grant fixup error", "err", err)
+				}
+			}
 		}
 		be.Send(msg)
 		if err := be.Flush(); err != nil {
@@ -156,7 +211,7 @@ func pumpUpstreamToClient(fe *pgproto3.Frontend, be *pgproto3.Backend) error {
 	}
 }
 
-func pumpClientToUpstream(be *pgproto3.Backend, fe *pgproto3.Frontend, cfg Config) error {
+func pumpClientToUpstream(be *pgproto3.Backend, fe *pgproto3.Frontend, cfg Config, fixup *fixupState) error {
 	for {
 		msg, err := be.Receive()
 		if err != nil {
@@ -164,6 +219,12 @@ func pumpClientToUpstream(be *pgproto3.Backend, fe *pgproto3.Frontend, cfg Confi
 		}
 		switch m := msg.(type) {
 		case *pgproto3.Query:
+			if role := rewrite.ExtractCreateRole(m.String); role != "" {
+				fixup.record(role)
+				if cfg.LogRewrites && fixup.enabled() {
+					slog.Info("queued grant fixup", "role", role, "protocol", "Query")
+				}
+			}
 			if rewritten, applied := rewrite.Apply(m.String); len(applied) > 0 {
 				if cfg.LogRewrites {
 					slog.Info("rewrote Query", "rules", applied, "before", m.String, "after", rewritten)
@@ -171,6 +232,12 @@ func pumpClientToUpstream(be *pgproto3.Backend, fe *pgproto3.Frontend, cfg Confi
 				m.String = rewritten
 			}
 		case *pgproto3.Parse:
+			if role := rewrite.ExtractCreateRole(m.Query); role != "" {
+				fixup.record(role)
+				if cfg.LogRewrites && fixup.enabled() {
+					slog.Info("queued grant fixup", "role", role, "protocol", "Parse")
+				}
+			}
 			if rewritten, applied := rewrite.Apply(m.Query); len(applied) > 0 {
 				if cfg.LogRewrites {
 					slog.Info("rewrote Parse", "rules", applied, "before", m.Query, "after", rewritten)
@@ -178,11 +245,52 @@ func pumpClientToUpstream(be *pgproto3.Backend, fe *pgproto3.Frontend, cfg Confi
 				m.Query = rewritten
 			}
 		}
+		fixup.sendMu.Lock()
 		fe.Send(msg)
+		flushErr := fe.Flush()
+		fixup.sendMu.Unlock()
+		if flushErr != nil {
+			return flushErr
+		}
+	}
+}
+
+// runGrantFixup is called by pumpUpstreamToClient when it's about to forward
+// a ReadyForQuery and there are pending CREATE ROLE/USER grants. It holds
+// fixup.sendMu (so client→upstream forwards block) and uses the same Frontend
+// to send a Simple Query and consume its response, all on the same backend
+// connection. Errors from the GRANT are logged but never propagated to the
+// client — the original CREATE ROLE/USER already succeeded as far as the
+// client is concerned.
+func runGrantFixup(fe *pgproto3.Frontend, roles []string, fixup *fixupState) error {
+	fixup.sendMu.Lock()
+	defer fixup.sendMu.Unlock()
+
+	for _, role := range roles {
+		sql := rewrite.BuildGrant(role, fixup.masterRole)
+		slog.Info("auto-grant role", "role", role, "to", fixup.masterRole)
+		fe.Send(&pgproto3.Query{String: sql})
 		if err := fe.Flush(); err != nil {
 			return err
 		}
+		for {
+			resp, err := fe.Receive()
+			if err != nil {
+				return err
+			}
+			if errResp, ok := resp.(*pgproto3.ErrorResponse); ok {
+				slog.Warn("auto-grant statement returned error",
+					"role", role,
+					"to", fixup.masterRole,
+					"code", errResp.Code,
+					"message", errResp.Message)
+			}
+			if _, ok := resp.(*pgproto3.ReadyForQuery); ok {
+				break
+			}
+		}
 	}
+	return nil
 }
 
 func dialUpstream(ctx context.Context, cfg Config) (net.Conn, error) {

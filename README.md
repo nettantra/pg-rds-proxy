@@ -59,6 +59,23 @@ The entire rule set is table-driven and lives in `internal/rewrite/rules.go`. It
 
 That's it. No other catalog is touched. If Webmin or Virtualmin upstream adds another superuser-only query in the future, the fix is to add one row to that table.
 
+### Auto-grant after CREATE ROLE / CREATE USER
+
+On Amazon RDS the master user is not a real superuser, so when Virtualmin issues:
+
+```sql
+CREATE USER "nettantra_mydb" WITH PASSWORD '...';
+CREATE DATABASE "mydb" WITH OWNER = "nettantra_mydb";
+```
+
+…the second statement fails with `must be able to SET ROLE "nettantra_mydb"`, because the master user isn't a member of the role it just created. With `--auto-grant-roles` (or `PGRP_AUTO_GRANT_ROLES=1`) enabled, the proxy:
+
+1. Watches every `Query` and `Parse` for `CREATE ROLE` / `CREATE USER` / `CREATE GROUP` (skipping `CREATE USER MAPPING`) and queues the new role name on a per-connection list.
+2. At the next `ReadyForQuery` from upstream, the proxy holds back that `ReadyForQuery`, sends `GRANT "newrole" TO "<connecting user>"` as a separate Simple Query on the same backend connection, drains its response, then forwards the original `ReadyForQuery` to the client.
+3. Errors from the GRANT are logged but never propagated to the client — the original `CREATE` already succeeded.
+
+The grant target is auto-detected from the connecting user in the startup message, so any user that connects through the proxy will retain membership in everything they create. This keeps Webmin/Virtualmin completely unmodified.
+
 ## Quick start
 
 ### Build
