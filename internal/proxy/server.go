@@ -122,21 +122,32 @@ func pumpUpstreamToClient(fe *pgproto3.Frontend, be *pgproto3.Backend) error {
 		if err != nil {
 			return err
 		}
-		// The proxy terminates the client connection in plaintext, so we must
-		// strip channel-binding SASL mechanisms (SCRAM-SHA-256-PLUS) before
-		// forwarding. Otherwise libpq refuses with
-		// "server offered SCRAM-SHA-256-PLUS authentication over a non-SSL connection".
-		if sasl, ok := msg.(*pgproto3.AuthenticationSASL); ok {
-			filtered := sasl.AuthMechanisms[:0:0]
-			for _, m := range sasl.AuthMechanisms {
-				if !strings.HasSuffix(m, "-PLUS") {
-					filtered = append(filtered, m)
+		switch m := msg.(type) {
+		case *pgproto3.AuthenticationSASL:
+			// We terminate the client side in plaintext, so strip channel-
+			// binding mechanisms. libpq otherwise refuses with "server offered
+			// SCRAM-SHA-256-PLUS authentication over a non-SSL connection".
+			filtered := m.AuthMechanisms[:0:0]
+			for _, mech := range m.AuthMechanisms {
+				if !strings.HasSuffix(mech, "-PLUS") {
+					filtered = append(filtered, mech)
 				}
 			}
 			if len(filtered) == 0 {
-				return fmt.Errorf("upstream only offered channel-binding SASL mechanisms %v, which cannot be proxied over a plaintext client connection", sasl.AuthMechanisms)
+				return fmt.Errorf("upstream only offered channel-binding SASL mechanisms %v, cannot proxy over plaintext client connection", m.AuthMechanisms)
 			}
-			sasl.AuthMechanisms = filtered
+			m.AuthMechanisms = filtered
+			_ = be.SetAuthType(pgproto3.AuthTypeSASL)
+		case *pgproto3.AuthenticationSASLContinue:
+			_ = be.SetAuthType(pgproto3.AuthTypeSASLContinue)
+		case *pgproto3.AuthenticationSASLFinal:
+			_ = be.SetAuthType(pgproto3.AuthTypeSASLFinal)
+		case *pgproto3.AuthenticationMD5Password:
+			_ = be.SetAuthType(pgproto3.AuthTypeMD5Password)
+		case *pgproto3.AuthenticationCleartextPassword:
+			_ = be.SetAuthType(pgproto3.AuthTypeCleartextPassword)
+		case *pgproto3.AuthenticationOk:
+			_ = be.SetAuthType(pgproto3.AuthTypeOk)
 		}
 		be.Send(msg)
 		if err := be.Flush(); err != nil {
