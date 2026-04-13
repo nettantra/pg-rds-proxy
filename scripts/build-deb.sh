@@ -21,7 +21,7 @@ echo ">> compiling pg-rds-proxy for linux/amd64 (version=${VERSION})"
 docker run --rm \
   -v "$PWD":/src -w /src \
   -e CGO_ENABLED=0 -e GOOS=linux -e GOARCH=amd64 \
-  golang:1.22-alpine \
+  golang:1.26-alpine \
   sh -c "apk add --no-cache git >/dev/null && \
          go build -trimpath \
            -ldflags \"-s -w -X main.version=${VERSION} -X main.commit=${COMMIT}\" \
