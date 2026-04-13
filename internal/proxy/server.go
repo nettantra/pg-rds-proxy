@@ -12,6 +12,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"strings"
 	"sync"
 	"time"
 
@@ -120,6 +121,22 @@ func pumpUpstreamToClient(fe *pgproto3.Frontend, be *pgproto3.Backend) error {
 		msg, err := fe.Receive()
 		if err != nil {
 			return err
+		}
+		// The proxy terminates the client connection in plaintext, so we must
+		// strip channel-binding SASL mechanisms (SCRAM-SHA-256-PLUS) before
+		// forwarding. Otherwise libpq refuses with
+		// "server offered SCRAM-SHA-256-PLUS authentication over a non-SSL connection".
+		if sasl, ok := msg.(*pgproto3.AuthenticationSASL); ok {
+			filtered := sasl.AuthMechanisms[:0:0]
+			for _, m := range sasl.AuthMechanisms {
+				if !strings.HasSuffix(m, "-PLUS") {
+					filtered = append(filtered, m)
+				}
+			}
+			if len(filtered) == 0 {
+				return fmt.Errorf("upstream only offered channel-binding SASL mechanisms %v, which cannot be proxied over a plaintext client connection", sasl.AuthMechanisms)
+			}
+			sasl.AuthMechanisms = filtered
 		}
 		be.Send(msg)
 		if err := be.Flush(); err != nil {
