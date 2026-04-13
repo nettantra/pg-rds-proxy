@@ -1,0 +1,148 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to build (e.g. v0.1.0). Leave blank to build HEAD as a prerelease.'
+        required: false
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  artifacts:
+    name: build binary and deb
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache: true
+
+      - name: Compute version metadata
+        id: meta
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            VERSION="${GITHUB_REF_NAME}"
+          else
+            VERSION="$(git describe --tags --always --dirty 2>/dev/null || echo 0.0.0-dev)"
+          fi
+          COMMIT="$(git rev-parse --short HEAD)"
+          DEB_VERSION="${VERSION#v}"
+          DEB_VERSION="${DEB_VERSION%-dirty}"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "commit=${COMMIT}" >> "$GITHUB_OUTPUT"
+          echo "deb_version=${DEB_VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Run tests
+        run: go test ./...
+
+      - name: Build linux/amd64 binary
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+          COMMIT: ${{ steps.meta.outputs.commit }}
+        run: |
+          mkdir -p bin dist
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+          go build -trimpath \
+            -ldflags "-s -w -X main.version=${VERSION} -X main.commit=${COMMIT}" \
+            -o bin/pg-rds-proxy.linux-amd64 ./cmd/pg-rds-proxy
+
+      - name: Create tarball
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          tar -czf dist/pg-rds-proxy_${VERSION}_linux_amd64.tar.gz \
+            -C bin pg-rds-proxy.linux-amd64
+
+      - name: Build .deb with nfpm
+        env:
+          VERSION: ${{ steps.meta.outputs.deb_version }}
+        run: |
+          docker run --rm \
+            -v "$PWD":/work -w /work \
+            -e VERSION="${VERSION}" \
+            goreleaser/nfpm:latest \
+            package \
+              --config packaging/nfpm.yaml \
+              --packager deb \
+              --target dist/
+
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum * > SHA256SUMS
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-artifacts
+          path: dist/*
+          if-no-files-found: error
+
+  image:
+    name: build and push container image
+    runs-on: ubuntu-latest
+    needs: artifacts
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable=${{ github.ref_type == 'tag' }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ needs.artifacts.outputs.version }}
+            COMMIT=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  release:
+    name: publish github release
+    runs-on: ubuntu-latest
+    needs: [artifacts, image]
+    if: github.ref_type == 'tag'
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-artifacts
+          path: dist
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true

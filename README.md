@@ -64,14 +64,35 @@ That's it. No other catalog is touched. If Webmin or Virtualmin upstream adds an
 ### Build
 
 ```sh
-go build ./cmd/pg-rds-proxy
+make build          # host binary in ./bin/pg-rds-proxy
+make build-linux    # static linux/amd64 in ./bin/pg-rds-proxy.linux-amd64
+make test           # unit tests (rewrite rules)
+make docker         # OCI image (linux/amd64) via scripts/build-docker.sh
+make deb            # .deb package in ./dist/ via scripts/build-deb.sh
 ```
+
+Both `make docker` and `make deb` run entirely inside containers, so Docker is the only host dependency. The deb target produces a package that installs:
+
+- `/usr/bin/pg-rds-proxy` &nbsp;the binary
+- `/lib/systemd/system/pg-rds-proxy.service` &nbsp;a hardened systemd unit
+- `/etc/pg-rds-proxy/pg-rds-proxy.conf` &nbsp;the daemon's config file (mode `0640`, owned by `root:pg-rds-proxy`)
+
+On install, the package creates a dedicated `pg-rds-proxy` system user, enables the unit, and reloads systemd. To bring the daemon up:
+
+```sh
+sudoedit /etc/pg-rds-proxy/pg-rds-proxy.conf   # set PGRP_UPSTREAM=...
+sudo systemctl start pg-rds-proxy
+sudo systemctl status pg-rds-proxy
+journalctl -u pg-rds-proxy -f
+```
+
+The service invokes `/usr/bin/pg-rds-proxy --config /etc/pg-rds-proxy/pg-rds-proxy.conf`. The binary reads that file directly (simple `KEY=VALUE` format), so you can also run it outside systemd with the same config: `pg-rds-proxy --config /etc/pg-rds-proxy/pg-rds-proxy.conf`. Real environment variables and CLI flags override anything in the file.
 
 ### Run
 
 ```sh
 pg-rds-proxy \
-  --listen 127.0.0.1:5432 \
+  --listen 127.0.0.1:5532 \
   --upstream mydb.cluster-xxxx.us-east-1.rds.amazonaws.com:5432 \
   --upstream-tls require \
   --upstream-user virtualmin_admin \
@@ -83,7 +104,7 @@ pg-rds-proxy \
 In Webmin, go to **Servers -> PostgreSQL Database Server -> Module Config** and set:
 
 - **Host for TCP connection**: `127.0.0.1` (the proxy)
-- **Port for TCP connection**: `5432` (the proxy)
+- **Port for TCP connection**: `5532` (the proxy)
 - **Login for administration**: the RDS master user
 - **Password for administration**: the RDS master password
 
@@ -93,7 +114,7 @@ Virtualmin inherits these settings from the Webmin module, so no separate config
 
 | Flag | Description | Default |
 |---|---|---|
-| `--listen` | Address the proxy binds to for Webmin/Virtualmin | `127.0.0.1:5432` |
+| `--listen` | Address the proxy binds to for Webmin/Virtualmin | `127.0.0.1:5532` |
 | `--upstream` | RDS endpoint `host:port` | required |
 | `--upstream-tls` | TLS mode: `disable`, `require`, `verify-full` | `require` |
 | `--upstream-user` | Backend login role | required |
@@ -117,8 +138,10 @@ Webmin/Virtualmin open very few concurrent connections, so the default pool is s
 cmd/pg-rds-proxy/     main entrypoint and flag wiring
 internal/proxy/       pgwire accept loop, frontend/backend pumps
 internal/rewrite/     the two rewrite rules and their tests
-internal/pool/        backend connection pool
-internal/auth/        IAM token + password auth helpers
+packaging/            systemd unit, env file, nfpm deb config
+scripts/              build-docker.sh, build-deb.sh
+Dockerfile            multi-stage build, distroless runtime
+Makefile              build / build-linux / test / docker / deb
 ```
 
 ## Scope and non-goals

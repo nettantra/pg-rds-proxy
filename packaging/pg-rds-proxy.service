@@ -1,0 +1,29 @@
+[Unit]
+Description=pg-rds-proxy - Virtualmin/Webmin compatibility proxy for Amazon RDS PostgreSQL
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pg-rds-proxy
+Group=pg-rds-proxy
+ExecStart=/usr/bin/pg-rds-proxy --config /etc/pg-rds-proxy/pg-rds-proxy.conf
+Restart=on-failure
+RestartSec=2s
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictRealtime=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target
