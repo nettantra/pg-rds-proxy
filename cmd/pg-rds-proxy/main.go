@@ -49,6 +49,7 @@ func main() {
 	flag.StringVar(&cfg.UpstreamTLS, "upstream-tls", env("PGRP_UPSTREAM_TLS", "require"), "upstream TLS mode: disable|require|verify-full")
 	flag.BoolVar(&cfg.LogRewrites, "log-rewrites", env("PGRP_LOG_REWRITES", "") != "", "log each statement the proxy rewrites")
 	flag.BoolVar(&cfg.AutoGrantRoles, "auto-grant-roles", env("PGRP_AUTO_GRANT_ROLES", "") != "", "after CREATE ROLE/USER, run GRANT <newrole> TO <connecting user> on the same connection (RDS workaround for must-be-able-to-SET-ROLE errors)")
+	flag.BoolVar(&cfg.AutoTerminateOnDrop, "auto-terminate-on-drop", env("PGRP_AUTO_TERMINATE_ON_DROP", "") != "", "before DROP DATABASE, terminate every other backend on the target database (RDS/Webmin workaround for stale-session DROP failures)")
 	flag.StringVar(&logLevel, "log-level", env("PGRP_LOG_LEVEL", "info"), "log level: debug|info|warn|error")
 	flag.BoolVar(&showVersion, "version", false, "print version and exit")
 	flag.Parse()

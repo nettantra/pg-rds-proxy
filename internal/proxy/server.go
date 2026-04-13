@@ -22,26 +22,59 @@ import (
 )
 
 type Config struct {
-	Listen         string
-	Upstream       string
-	UpstreamTLS    string
-	LogRewrites    bool
-	AutoGrantRoles bool
+	Listen              string
+	Upstream            string
+	UpstreamTLS         string
+	LogRewrites         bool
+	AutoGrantRoles      bool
+	AutoTerminateOnDrop bool
 }
 
-// fixupState carries per-connection state for the auto-grant feature: the
-// list of roles created since the last ReadyForQuery, plus a mutex that
-// serializes writes to the upstream Frontend (so the GRANT injection can't
-// interleave bytes with a normal client→upstream forward).
+// fixupState carries per-connection state for the auto-grant and
+// auto-terminate features.
+//
+//   - sendMu serializes writes to the upstream Frontend so injection can't
+//     interleave bytes with a normal client→upstream forward.
+//   - swallowMu / swallowing gate the upstream→client pump: while swallowing
+//     is true, every backend message is dropped until the next ReadyForQuery
+//     (which is also dropped). This is how we hide the response of a Query
+//     that the proxy itself injected on behalf of the client.
 type fixupState struct {
-	masterRole string
-	pendingMu  sync.Mutex
-	pending    []string
-	sendMu     sync.Mutex
+	masterRole    string
+	autoTerminate bool
+
+	pendingMu sync.Mutex
+	pending   []string
+
+	sendMu sync.Mutex
+
+	swallowMu  sync.Mutex
+	swallowing bool
 }
 
-func newFixupState(masterRole string) *fixupState {
-	return &fixupState{masterRole: masterRole}
+func newFixupState(masterRole string, autoTerminate bool) *fixupState {
+	return &fixupState{masterRole: masterRole, autoTerminate: autoTerminate}
+}
+
+func (s *fixupState) setSwallow() {
+	s.swallowMu.Lock()
+	s.swallowing = true
+	s.swallowMu.Unlock()
+}
+
+// shouldSwallow returns true when msg should be dropped silently. When the
+// passed message is a ReadyForQuery, the swallow flag is also cleared so
+// subsequent messages start flowing again.
+func (s *fixupState) shouldSwallow(msg pgproto3.BackendMessage) bool {
+	s.swallowMu.Lock()
+	defer s.swallowMu.Unlock()
+	if !s.swallowing {
+		return false
+	}
+	if _, ok := msg.(*pgproto3.ReadyForQuery); ok {
+		s.swallowing = false
+	}
+	return true
 }
 
 func (s *fixupState) enabled() bool { return s.masterRole != "" }
@@ -147,7 +180,7 @@ func handle(ctx context.Context, client net.Conn, cfg Config) error {
 	if cfg.AutoGrantRoles {
 		grantTarget = startup.Parameters["user"]
 	}
-	fixup := newFixupState(grantTarget)
+	fixup := newFixupState(grantTarget, cfg.AutoTerminateOnDrop)
 
 	errCh := make(chan error, 2)
 	go func() { errCh <- pumpUpstreamToClient(frontend, backend, fixup) }()
@@ -168,6 +201,11 @@ func pumpUpstreamToClient(fe *pgproto3.Frontend, be *pgproto3.Backend, fixup *fi
 		msg, err := fe.Receive()
 		if err != nil {
 			return err
+		}
+		// Drop responses to proxy-injected queries (e.g. pg_terminate_backend
+		// before DROP DATABASE) so the client never sees them.
+		if fixup.shouldSwallow(msg) {
+			continue
 		}
 		switch m := msg.(type) {
 		case *pgproto3.AuthenticationSASL:
@@ -225,6 +263,16 @@ func pumpClientToUpstream(be *pgproto3.Backend, fe *pgproto3.Frontend, cfg Confi
 					slog.Info("queued grant fixup", "role", role, "protocol", "Query")
 				}
 			}
+			if fixup.autoTerminate {
+				if dbname := rewrite.ExtractDropDatabase(m.String); dbname != "" {
+					if err := injectTerminate(fe, dbname, fixup); err != nil {
+						return err
+					}
+					if cfg.LogRewrites {
+						slog.Info("auto-terminate before DROP DATABASE", "database", dbname, "protocol", "Query")
+					}
+				}
+			}
 			if rewritten, applied := rewrite.Apply(m.String); len(applied) > 0 {
 				if cfg.LogRewrites {
 					slog.Info("rewrote Query", "rules", applied, "before", m.String, "after", rewritten)
@@ -236,6 +284,16 @@ func pumpClientToUpstream(be *pgproto3.Backend, fe *pgproto3.Frontend, cfg Confi
 				fixup.record(role)
 				if cfg.LogRewrites && fixup.enabled() {
 					slog.Info("queued grant fixup", "role", role, "protocol", "Parse")
+				}
+			}
+			if fixup.autoTerminate {
+				if dbname := rewrite.ExtractDropDatabase(m.Query); dbname != "" {
+					if err := injectTerminate(fe, dbname, fixup); err != nil {
+						return err
+					}
+					if cfg.LogRewrites {
+						slog.Info("auto-terminate before DROP DATABASE", "database", dbname, "protocol", "Parse")
+					}
 				}
 			}
 			if rewritten, applied := rewrite.Apply(m.Query); len(applied) > 0 {
@@ -253,6 +311,20 @@ func pumpClientToUpstream(be *pgproto3.Backend, fe *pgproto3.Frontend, cfg Confi
 			return flushErr
 		}
 	}
+}
+
+// injectTerminate sends a Simple Query that asks the upstream to terminate
+// every other backend on dbname. It runs before forwarding the client's DROP
+// DATABASE so the DROP doesn't trip over leftover sessions. The response is
+// not waited for here — fixup.shouldSwallow drops it on the upstream→client
+// pump as it arrives.
+func injectTerminate(fe *pgproto3.Frontend, dbname string, fixup *fixupState) error {
+	fixup.setSwallow()
+	sql := rewrite.BuildTerminate(dbname)
+	fixup.sendMu.Lock()
+	defer fixup.sendMu.Unlock()
+	fe.Send(&pgproto3.Query{String: sql})
+	return fe.Flush()
 }
 
 // runGrantFixup is called by pumpUpstreamToClient when it's about to forward

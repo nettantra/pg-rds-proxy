@@ -76,6 +76,17 @@ CREATE DATABASE "mydb" WITH OWNER = "nettantra_mydb";
 
 The grant target is auto-detected from the connecting user in the startup message, so any user that connects through the proxy will retain membership in everything they create. This keeps Webmin/Virtualmin completely unmodified.
 
+### Auto-terminate before DROP DATABASE
+
+PostgreSQL refuses `DROP DATABASE` while any backend has the target database as its current session. Webmin's domain teardown often hits this when the deleted domain still has a stray browser tab or backup process holding a connection. With `--auto-terminate-on-drop` (or `PGRP_AUTO_TERMINATE_ON_DROP=1`) enabled, the proxy:
+
+1. Watches every `Query` and `Parse` for `DROP DATABASE [IF EXISTS] "name"`.
+2. Before forwarding the DROP, sends a Simple Query to the same backend connection: `SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '<name>' AND pid <> pg_backend_pid()`. The proxy's own session is excluded.
+3. Drops the terminate's response on the upstream→client pump (the client never sees it).
+4. Forwards the original DROP, which now succeeds.
+
+The terminate query needs `pg_signal_backend` privileges on RDS — the master user (`rds_superuser`) already has them, so no extra setup is required.
+
 ## Quick start
 
 ### Build
